@@ -1,0 +1,130 @@
+name: Nevermined images
+
+# Builds the self-hosted Helicone images Nevermined deploys (jawn, web, migrations)
+# and pushes them to Google Artifact Registry for Argo CD. Upstream stopped
+# publishing Docker images in August 2025, so this fork builds its own.
+# Keyless auth via Workload Identity Federation (no secrets).
+#
+#   pull_request  -> build only; no credentials, no push.
+#   push to main  -> build and push.
+#   dispatch      -> build and push.
+#
+# The AR repo has immutableTags=true, so only sha-<short> is published (no `latest`).
+
+on:
+  pull_request:
+    paths:
+      - "valhalla/**"
+      - "web/**"
+      - "packages/**"
+      - "shared/**"
+      - "supabase/**"
+      - "clickhouse/**"
+      - "docker/dockerfiles/**"
+      - "package.json"
+      - "yarn.lock"
+      - ".github/workflows/nevermined-images.yml"
+  push:
+    branches: [main]
+    paths:
+      - "valhalla/**"
+      - "web/**"
+      - "packages/**"
+      - "shared/**"
+      - "supabase/**"
+      - "clickhouse/**"
+      - "docker/dockerfiles/**"
+      - "package.json"
+      - "yarn.lock"
+      - ".github/workflows/nevermined-images.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: nevermined-images-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: europe-west3-docker.pkg.dev/nevermined-eu-dev/nevermined-io
+  AR_LOCATION: europe-west3
+  PROJECT_ID: nevermined-eu-dev
+  SERVICE_ACCOUNT: github-actions-service-account@nevermined-eu-dev.iam.gserviceaccount.com
+  WORKLOAD_IDENTITY_PROVIDER: projects/112425687177/locations/global/workloadIdentityPools/github/providers/github-actions
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: helicone-jawn
+            file: ./valhalla/dockerfile
+          - image: helicone-web
+            file: ./docker/dockerfiles/dockerfile_web
+          - image: helicone-migrations
+            file: ./docker/dockerfiles/dockerfile_migrations
+    steps:
+      # The jawn image installs torch; the default runner disk is too small for it.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image }}
+          tags: type=sha,prefix=sha-,format=short
+
+      - name: Authenticate to Google Cloud
+        if: github.event_name != 'pull_request'
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          project_id: ${{ env.PROJECT_ID }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+
+      - name: Log in to Artifact Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.AR_LOCATION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          provenance: false
+          sbom: false
+
+      - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### ${{ matrix.image }}"
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
