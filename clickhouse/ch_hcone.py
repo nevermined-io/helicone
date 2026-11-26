@@ -84,6 +84,11 @@ def split_sql_statements(sql_content):
     return statements
 
 
+def redact(text, password):
+    """Hide the ClickHouse password in anything this script prints (it lands in pod logs)."""
+    return text.replace(password, "[REDACTED]") if password else text
+
+
 def run_curl_command(query, args, user=None, password=None, migration_file=None):
     base_url = get_url(args)
     auth = f"--user '{user}:{password}'" if user and password else ""
@@ -107,7 +112,7 @@ def run_curl_command(query, args, user=None, password=None, migration_file=None)
         print("ERROR: Failed to connect to ClickHouse")
         print("="*60)
         print(f"URL: {base_url}")
-        print(f"Command: {curl_cmd}")
+        print(f"Command: {redact(curl_cmd, password)}")
         print(f"\nSTDOUT: {result.stdout}")
         print(f"STDERR: {result.stderr}")
         print("="*60 + "\n")
@@ -450,13 +455,13 @@ def main():
         password = getpass.getpass(
             prompt="Enter password for ClickHouse server user: ")
 
-    print(f"""
+    print(redact(f"""
     Running:
     {parser.prog} {" ".join(sys.argv[1:])}
 
     Args collected:
     {args}
-    """)
+    """, password))
 
     if args.start:
         print("Starting services")

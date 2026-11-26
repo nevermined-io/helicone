@@ -44,7 +44,7 @@ RUN echo '#!/bin/sh \n\
     \n\
     echo "Running ClickHouse migrations..." \n\
     if [ -n "${CLICKHOUSE_PASSWORD}" ]; then \n\
-        python3 /app/clickhouse/ch_hcone.py --upgrade --password "${CLICKHOUSE_PASSWORD}" --skip-confirmation \n\
+        python3 /app/clickhouse/ch_hcone.py --upgrade --skip-confirmation \n\
     else \n\
         python3 /app/clickhouse/ch_hcone.py --upgrade --no-password --skip-confirmation \n\
     fi \n\
