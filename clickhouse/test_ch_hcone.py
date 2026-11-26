@@ -62,6 +62,18 @@ class PasswordNeverPrinted(unittest.TestCase):
         self.assert_hidden(marker, output)
 
 
+class MaskUserinfo(unittest.TestCase):
+    def test_masks_a_yarl_url(self):
+        """get_url() returns a yarl URL for a URL-form host; the --start/--restart prints pass it as is."""
+        sys.path.insert(0, HERE)
+        import ch_hcone
+        from yarl import URL
+
+        self.assertEqual(
+            ch_hcone.mask_userinfo(URL("http://default:pw@127.0.0.1:1")), "http://[REDACTED]@127.0.0.1:1"
+        )
+
+
 class EntrypointKeepsPasswordOutOfArgv(unittest.TestCase):
     def test_no_password_flag_in_entrypoint(self):
         with open(DOCKERFILE) as f:
