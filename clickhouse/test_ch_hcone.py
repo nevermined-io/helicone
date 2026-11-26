@@ -26,6 +26,11 @@ class PasswordNeverPrinted(unittest.TestCase):
         )
         output = result.stdout + result.stderr
         self.assertIn("Failed to connect to ClickHouse", output, "the diagnostics branch did not run")
+        # The whole block must print, or the checks below see nothing: Command:, STDOUT: and STDERR:
+        # come after the header.
+        self.assertNotIn("Traceback", output)
+        self.assertIn("Command:", output)
+        self.assertIn("STDERR:", output)
         return output
 
     def assert_hidden(self, marker, output):
@@ -49,6 +54,11 @@ class PasswordNeverPrinted(unittest.TestCase):
     def test_password_in_the_url(self):
         marker = uuid.uuid4().hex
         output = self.run_unreachable("x", "--no-password", host=f"http://default:pw-{marker}@127.0.0.1:1")
+        self.assert_hidden(marker, output)
+
+    def test_password_with_an_at_sign_in_the_url(self):
+        marker = uuid.uuid4().hex
+        output = self.run_unreachable("x", "--no-password", "--url", f"http://default:pw@{marker}@127.0.0.1:1")
         self.assert_hidden(marker, output)
 
 

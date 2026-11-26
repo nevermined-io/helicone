@@ -86,11 +86,11 @@ def split_sql_statements(sql_content):
 
 def mask_userinfo(text):
     """Hide credentials embedded in a URL (scheme://user:password@host) in printed text."""
-    return re.sub(r"(://)[^/@\s]+@", r"\1[REDACTED]@", text)
+    return re.sub(r"(://)[^/\s]+@", r"\1[REDACTED]@", str(text))
 
 
 def run_curl_command(query, args, user=None, password=None, migration_file=None):
-    base_url = get_url(args)
+    base_url = str(get_url(args))
     # The credential reaches curl through the environment, never through the command string, which is
     # printed below, visible in /proc, and broken by a quote in the password. In the migrations image this
     # output is a pod log (nevermined-io/argocd#920).
@@ -485,7 +485,7 @@ def main():
                            user=args.user, password=password)
             print(f"""
 Test query by running:
-echo 'SELECT 1' | curl '{get_url(args)}/' --data-binary @-
+echo 'SELECT 1' | curl '{mask_userinfo(get_url(args))}/' --data-binary @-
             """)
 
     elif args.stop:
@@ -507,7 +507,7 @@ echo 'SELECT 1' | curl '{get_url(args)}/' --data-binary @-
         run_migrations(args, user=args.user, password=password)
         print(f"""
 Test query by running:
-echo 'SELECT 1' | curl '{get_url(args)}/' --data-binary @-
+echo 'SELECT 1' | curl '{mask_userinfo(get_url(args))}/' --data-binary @-
         """)
 
     elif args.upgrade:

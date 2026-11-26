@@ -60,6 +60,9 @@ jobs:
   ch-hcone-tests:
     name: ch_hcone.py keeps the password out of its output
     runs-on: ubuntu-latest
+    # Runs code freshly installed from PyPI: no OIDC token for the Artifact Registry identity.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
