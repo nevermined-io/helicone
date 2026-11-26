@@ -34,6 +34,8 @@ RUN chmod +x /app/clickhouse/ch_hcone.py
 RUN chown 2000:2000 /opt/flyway/flyway && chmod 755 /opt/flyway/flyway
 
 # Create a script to run migrations
+# ch_hcone.py reads CLICKHOUSE_PASSWORD from the environment. Never pass it in argv: --no-password only
+# skips the interactive prompt (nevermined-io/argocd#920).
 RUN echo '#!/bin/sh \n\
     set -e \n\
     echo "Running PostgreSQL migrations..." \n\
@@ -43,11 +45,7 @@ RUN echo '#!/bin/sh \n\
     echo "PostgreSQL migrations completed" \n\
     \n\
     echo "Running ClickHouse migrations..." \n\
-    if [ -n "${CLICKHOUSE_PASSWORD}" ]; then \n\
-        python3 /app/clickhouse/ch_hcone.py --upgrade --password "${CLICKHOUSE_PASSWORD}" --skip-confirmation \n\
-    else \n\
-        python3 /app/clickhouse/ch_hcone.py --upgrade --no-password --skip-confirmation \n\
-    fi \n\
+    python3 /app/clickhouse/ch_hcone.py --upgrade --no-password --skip-confirmation \n\
     echo "ClickHouse migrations completed" \n\
     \n\
     echo "All migrations completed successfully!" \n\

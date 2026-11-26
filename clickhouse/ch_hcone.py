@@ -84,9 +84,18 @@ def split_sql_statements(sql_content):
     return statements
 
 
+def mask_userinfo(text):
+    """Hide credentials embedded in a URL (scheme://user:password@host) in printed text."""
+    return re.sub(r"(://)[^/\s]+@", r"\1[REDACTED]@", str(text))
+
+
 def run_curl_command(query, args, user=None, password=None, migration_file=None):
-    base_url = get_url(args)
-    auth = f"--user '{user}:{password}'" if user and password else ""
+    base_url = str(get_url(args))
+    # The credential reaches curl through the environment, never through the command string, which is
+    # printed below, visible in /proc, and broken by a quote in the password. In the migrations image this
+    # output is a pod log (nevermined-io/argocd#920).
+    auth = '--user "$CH_AUTH"' if user and password else ""
+    env = {**os.environ, "CH_AUTH": f"{user}:{password}"} if auth else None
     timeout_opts = "--connect-timeout 5"
 
     if not query:
@@ -99,17 +108,17 @@ def run_curl_command(query, args, user=None, password=None, migration_file=None)
         ).strip()
 
     result = subprocess.run(curl_cmd, shell=True,
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, env=env)
     
     # Check for curl errors (connection issues)
     if result.returncode != 0:
         print("\n" + "="*60)
         print("ERROR: Failed to connect to ClickHouse")
         print("="*60)
-        print(f"URL: {base_url}")
-        print(f"Command: {curl_cmd}")
-        print(f"\nSTDOUT: {result.stdout}")
-        print(f"STDERR: {result.stderr}")
+        print(f"URL: {mask_userinfo(base_url)}")
+        print(f"Command: {mask_userinfo(curl_cmd)}")
+        print(f"\nSTDOUT: {mask_userinfo(result.stdout)}")
+        print(f"STDERR: {mask_userinfo(result.stderr)}")
         print("="*60 + "\n")
         sys.exit(1)
     
@@ -450,13 +459,15 @@ def main():
         password = getpass.getpass(
             prompt="Enter password for ClickHouse server user: ")
 
-    print(f"""
+    # Not sys.argv, and not the password field: either would print the password (argocd#920).
+    shown = {k: v for k, v in vars(args).items() if k != "password"}
+    print(mask_userinfo(f"""
     Running:
-    {parser.prog} {" ".join(sys.argv[1:])}
+    {parser.prog}
 
-    Args collected:
-    {args}
-    """)
+    Args collected (password not shown):
+    {shown}
+    """))
 
     if args.start:
         print("Starting services")
@@ -474,7 +485,7 @@ def main():
                            user=args.user, password=password)
             print(f"""
 Test query by running:
-echo 'SELECT 1' | curl '{get_url(args)}/' --data-binary @-
+echo 'SELECT 1' | curl '{mask_userinfo(get_url(args))}/' --data-binary @-
             """)
 
     elif args.stop:
@@ -496,7 +507,7 @@ echo 'SELECT 1' | curl '{get_url(args)}/' --data-binary @-
         run_migrations(args, user=args.user, password=password)
         print(f"""
 Test query by running:
-echo 'SELECT 1' | curl '{get_url(args)}/' --data-binary @-
+echo 'SELECT 1' | curl '{mask_userinfo(get_url(args))}/' --data-binary @-
         """)
 
     elif args.upgrade:
