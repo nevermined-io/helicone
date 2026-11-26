@@ -55,8 +55,22 @@ permissions:
   id-token: write
 
 jobs:
+  # The migrations image's output is jawn's init container log: no build ships a ch_hcone.py that prints
+  # the ClickHouse password (nevermined-io/argocd#920).
+  ch-hcone-tests:
+    name: ch_hcone.py keeps the password out of its output
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet -r clickhouse/requirements.txt
+      - run: python3 -m unittest clickhouse/test_ch_hcone.py
+
   build:
     name: ${{ matrix.image }}
+    needs: ch-hcone-tests
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
