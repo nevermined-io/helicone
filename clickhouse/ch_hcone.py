@@ -96,7 +96,9 @@ def run_curl_command(query, args, user=None, password=None, migration_file=None)
     # output is a pod log (nevermined-io/argocd#920).
     auth = '--user "$CH_AUTH"' if user and password else ""
     env = {**os.environ, "CH_AUTH": f"{user}:{password}"} if auth else None
-    timeout_opts = "--connect-timeout 5"
+    # --fail-with-body: an HTTP error with no ClickHouse text in its body (a proxy's 502 page, an empty 503)
+    # must still count as a failure. curl then exits 22 and keeps the body.
+    timeout_opts = "--connect-timeout 5 --fail-with-body"
 
     if not query:
         curl_cmd = (
@@ -110,8 +112,13 @@ def run_curl_command(query, args, user=None, password=None, migration_file=None)
     result = subprocess.run(curl_cmd, shell=True,
                             capture_output=True, text=True, env=env)
     
+    # Exit 22 is an HTTP status of 400 or more: ClickHouse, or something in front of it, answered and
+    # refused the statement. Any other non-zero exit means no complete HTTP answer: unreachable, or the
+    # connection dropped (curl 52/56, e.g. ClickHouse restarted mid-ALTER), so the statement may have run.
+    http_error = result.returncode == 22
+
     # Check for curl errors (connection issues)
-    if result.returncode != 0:
+    if result.returncode != 0 and not http_error:
         print("\n" + "="*60)
         print("ERROR: Failed to connect to ClickHouse")
         print("="*60)
@@ -124,7 +131,7 @@ def run_curl_command(query, args, user=None, password=None, migration_file=None)
     
     # Check for ClickHouse errors in the response
     response = result.stdout.strip()
-    if response and ('Exception' in response or 'DB::Exception' in response or 'Error' in response):
+    if http_error or (response and ('Exception' in response or 'DB::Exception' in response or 'Error' in response)):
         print("\n" + "="*60)
         print("ERROR: ClickHouse returned an error")
         print("="*60)
@@ -133,7 +140,7 @@ def run_curl_command(query, args, user=None, password=None, migration_file=None)
         if query:
             print(f"Query: {query[:200]}..." if len(query) > 200 else f"Query: {query}")
         print(f"\nClickHouse Error Response:")
-        print(response)
+        print(response if response else f"(empty body) {mask_userinfo(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else '')}")
         print("="*60 + "\n")
         # Don't exit here, let the caller handle it
         result.clickhouse_error = True
@@ -154,7 +161,9 @@ def run_migration_file(migration_file, args, user=None, password=None):
     
     if len(statements) == 1:
         # Single statement, run normally
-        return run_curl_command(None, args, user, password, migration_file)
+        result = run_curl_command(None, args, user, password, migration_file)
+        result.failed_statement = "1/1" if result.clickhouse_error else None
+        return result
     
     # Multiple statements, run each separately
     print(f"  Migration contains {len(statements)} statements")
@@ -173,6 +182,7 @@ def run_migration_file(migration_file, args, user=None, password=None):
             compound_result = subprocess.CompletedProcess(args=[], returncode=1)
             compound_result.clickhouse_error = True
             compound_result.stdout = f"Failed on statement {i}/{len(statements)}"
+            compound_result.failed_statement = f"{i}/{len(statements)}"
             return compound_result
     
     # All statements succeeded
@@ -202,15 +212,24 @@ def create_migration_table(args, user=None, password=None):
         print("Created helicone_migrations table")
 
 
+def ledger_unreadable():
+    # Reading it as empty would re-apply every migration, DROP TABLE and backfills included, on every
+    # init restart (nevermined-io/argocd#923). Apply nothing instead.
+    print("ERROR: cannot read helicone_migrations, so no migration was applied. Fix ClickHouse first.")
+    sys.exit(1)
+
+
 def get_all_applied_migrations(args, user=None, password=None):
     """Get all applied migration names in a single query"""
     # First check if the table exists
     check_query = """
-    SELECT count(*) FROM system.tables WHERE database = 'default' AND name = 'helicone_migrations';
+    SELECT count(*) FROM system.tables WHERE database = currentDatabase() AND name = 'helicone_migrations';
     """
     check_res = run_curl_command(check_query, args, user, password)
-    
-    if check_res.returncode != 0 or check_res.stdout.strip() == "0":
+    if check_res.clickhouse_error or check_res.returncode != 0:
+        ledger_unreadable()
+
+    if check_res.stdout.strip() == "0":
         print("helicone_migrations table does not exist yet")
         return set()
     
@@ -218,9 +237,8 @@ def get_all_applied_migrations(args, user=None, password=None):
     SELECT migration_name FROM helicone_migrations;
     """
     res = run_curl_command(query, args, user, password)
-    if res.returncode != 0:
-        print(f"Warning: Failed to query applied migrations: {res.stderr}")
-        return set()
+    if res.clickhouse_error or res.returncode != 0:
+        ledger_unreadable()
     
     # Parse the result and return as a set for O(1) lookups
     applied_migrations = set()
@@ -247,7 +265,9 @@ def mark_migration_as_applied(migration_name, args, user=None, password=None):
     query = f"""
     INSERT INTO helicone_migrations (migration_name) VALUES ('{migration_name}');
     """
-    run_curl_command(query, args, user, password)
+    res = run_curl_command(query, args, user, password)
+    # run_curl_command exits on a connection failure, so only a refusal is left to check.
+    return not res.clickhouse_error
 
 
 def preview_migrations(args, user=None, password=None):
@@ -281,7 +301,7 @@ def run_migrations(args, retries=2, user=None, password=None):
     
     if not pending_migrations:
         print("No migrations to apply. All migrations are up to date.")
-        return
+        return [], []
     
     print(f"\nThe following {len(pending_migrations)} migration(s) will be applied:")
     for i, (migration_name, schema_path) in enumerate(pending_migrations, 1):
@@ -295,12 +315,18 @@ def run_migrations(args, retries=2, user=None, password=None):
                 break
             elif response in ['n', 'no', '']:
                 print("Migration cancelled.")
-                return
+                return [], []
             else:
                 print("Please enter 'y' for yes or 'n' for no.")
     
     # Apply migrations
     failed_migrations = []
+    # Which statement of each failed file failed: the ones after it did not run this time (after a refused
+    # record, they ran in the earlier attempt).
+    failed_at = {}
+    # Applied but not recorded: the fix is to check the schema and record it by hand, not to re-run it.
+    unrecorded_migrations = []
+    applied_now = 0
     for i, (migration_name, schema_path) in enumerate(pending_migrations, 1):
         print(f"\n[{i}/{len(pending_migrations)}] Running migration: {migration_name}")
         print(f"  File: {schema_path}")
@@ -310,6 +336,11 @@ def run_migrations(args, retries=2, user=None, password=None):
         if res.returncode != 0 or getattr(res, 'clickhouse_error', False):
             print(f"\n⚠️  Failed to run migration: {migration_name}")
             failed_migrations.append(migration_name)
+            failed_at[migration_name] = getattr(res, 'failed_statement', None)
+            if skip_confirmation:
+                # Unattended: a later migration would only add to what needs fixing by hand.
+                print("Stopping at the first failure (unattended run).")
+                break
             
             # Check if we should retry
             if retries > 0 and not skip_confirmation:
@@ -322,9 +353,14 @@ def run_migrations(args, retries=2, user=None, password=None):
                     # Retry only this specific migration
                     retry_res = run_migration_file(schema_path, args, user, password)
                     if retry_res.returncode == 0 and not getattr(retry_res, 'clickhouse_error', False):
+                        failed_migrations.remove(migration_name)
+                        if not mark_migration_as_applied(migration_name, args, user, password):
+                            print(f"\n⚠️  Applied but not recorded in helicone_migrations: {migration_name}")
+                            unrecorded_migrations.append(migration_name)
+                            continue
                         print(f"✅ Migration {migration_name} succeeded on retry")
-                        mark_migration_as_applied(migration_name, args, user, password)
                         applied_migrations.add(migration_name)
+                        applied_now += 1
                         continue
                     else:
                         print(f"❌ Migration {migration_name} failed again")
@@ -335,28 +371,53 @@ def run_migrations(args, retries=2, user=None, password=None):
                 if continue_response not in ['y', 'yes']:
                     print("\nStopping migration process.")
                     break
+        elif not mark_migration_as_applied(migration_name, args, user, password):
+            # Applied but not recorded (a full disk refused the INSERT, nevermined-io/argocd#923): the next
+            # run re-applies it, and a non-idempotent migration then fails forever. Count it as failed.
+            print(f"\n⚠️  Applied but not recorded in helicone_migrations: {migration_name}")
+            unrecorded_migrations.append(migration_name)
+            if skip_confirmation:
+                print("Stopping at the first failure (unattended run).")
+                break
         else:
             print(f"✅ Successfully applied migration: {migration_name}")
-            mark_migration_as_applied(
-                migration_name, args, user, password)
             # Add to the in-memory set to avoid duplicate runs within the same session
             applied_migrations.add(migration_name)
+            applied_now += 1
     
     # Summary
-    if failed_migrations:
+    if failed_migrations or unrecorded_migrations:
         print(f"\n" + "="*60)
         print(f"Migration Summary:")
-        print(f"  Successful: {len(pending_migrations) - len(failed_migrations)}/{len(pending_migrations)}")
-        print(f"  Failed: {len(failed_migrations)}/{len(pending_migrations)}")
-        print(f"\nFailed migrations:")
-        for failed in failed_migrations:
-            print(f"  - {failed}")
+        print(f"  Pending: {len(pending_migrations)}")
+        print(f"  Applied: {applied_now}")
+        print(f"  Failed to apply: {len(failed_migrations)}")
+        print(f"  Applied but not recorded: {len(unrecorded_migrations)}")
+        print(f"  Not attempted: {len(pending_migrations) - applied_now - len(failed_migrations) - len(unrecorded_migrations)}")
+        if failed_migrations:
+            # A restart after a refused record lands here: the ledger still lacks the row, so the migration
+            # runs again, and a non-idempotent one then fails with "already exists" (nevermined-io/argocd#923).
+            # The runner cannot tell the two cases apart, so the text covers both.
+            print(f"\nFailed migrations. If ClickHouse said it already exists, it may have been applied but not recorded:")
+            print(f"check that every statement of the file took effect, including data statements (MATERIALIZE,")
+            print(f"backfills) that a schema check cannot show. The statements after the failed one did not run")
+            print(f"this time; after a refused record they ran in the earlier attempt, so never re-run one blindly.")
+            print(f"Then record it with the INSERT below. Otherwise fix the cause and run again.")
+            for failed in failed_migrations:
+                where = f" (failed on statement {failed_at[failed]})" if failed_at.get(failed) else ""
+                print(f"  - {failed}{where}")
+                print(f"    INSERT INTO helicone_migrations (migration_name) VALUES ('{failed}')")
+        if unrecorded_migrations:
+            print(f"\nApplied but not recorded (do NOT run again: check the schema, then record each one):")
+            for name in unrecorded_migrations:
+                print(f"  - {name}: INSERT INTO helicone_migrations (migration_name) VALUES ('{name}')")
         print("="*60)
 
-    if not failed_migrations:
+    if not failed_migrations and not unrecorded_migrations:
         print(f"\n✅ Finished running all {len(pending_migrations)} migrations successfully")
     else:
-        print(f"\n⚠️  Finished with {len(failed_migrations)} failed migration(s)")
+        print(f"\n⚠️  Finished with {len(failed_migrations)} failed and {len(unrecorded_migrations)} unrecorded migration(s)")
+    return failed_migrations, unrecorded_migrations
 
 
 def list_migrations(args, user=None, password=None):
@@ -513,7 +574,12 @@ echo 'SELECT 1' | curl '{mask_userinfo(get_url(args))}/' --data-binary @-
     elif args.upgrade:
         print("Applying all migrations")
         create_migration_table(args, args.user, password)
-        run_migrations(args, user=args.user, password=password)
+        failed, unrecorded = run_migrations(args, user=args.user, password=password)
+        if (failed or unrecorded) and args.skip_confirmation:
+            # Unattended (jawn's init container): fail closed, so jawn does not start on a partial schema
+            # (nevermined-io/argocd#923). Interactive runs keep their prompts and exit 0.
+            print(f"Stopping: {len(failed)} migration(s) failed to apply, {len(unrecorded)} applied but not recorded")
+            sys.exit(1)
         print("Finished applying all migrations")
 
     elif args.list_migrations:
