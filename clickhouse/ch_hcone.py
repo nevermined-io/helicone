@@ -202,14 +202,23 @@ def create_migration_table(args, user=None, password=None):
         print("Created helicone_migrations table")
 
 
+def ledger_unreadable():
+    # Reading it as empty would re-apply every migration, DROP TABLE and backfills included, on every
+    # init restart (nevermined-io/argocd#923). Apply nothing instead.
+    print("ERROR: cannot read helicone_migrations, so no migration was applied. Fix ClickHouse first.")
+    sys.exit(1)
+
+
 def get_all_applied_migrations(args, user=None, password=None):
     """Get all applied migration names in a single query"""
     # First check if the table exists
     check_query = """
-    SELECT count(*) FROM system.tables WHERE database = 'default' AND name = 'helicone_migrations';
+    SELECT count(*) FROM system.tables WHERE database = currentDatabase() AND name = 'helicone_migrations';
     """
     check_res = run_curl_command(check_query, args, user, password)
-    
+    if getattr(check_res, 'clickhouse_error', False):
+        ledger_unreadable()
+
     if check_res.returncode != 0 or check_res.stdout.strip() == "0":
         print("helicone_migrations table does not exist yet")
         return set()
@@ -218,6 +227,8 @@ def get_all_applied_migrations(args, user=None, password=None):
     SELECT migration_name FROM helicone_migrations;
     """
     res = run_curl_command(query, args, user, password)
+    if getattr(res, 'clickhouse_error', False):
+        ledger_unreadable()
     if res.returncode != 0:
         print(f"Warning: Failed to query applied migrations: {res.stderr}")
         return set()
@@ -282,7 +293,7 @@ def run_migrations(args, retries=2, user=None, password=None):
     
     if not pending_migrations:
         print("No migrations to apply. All migrations are up to date.")
-        return
+        return [], []
     
     print(f"\nThe following {len(pending_migrations)} migration(s) will be applied:")
     for i, (migration_name, schema_path) in enumerate(pending_migrations, 1):
@@ -296,12 +307,14 @@ def run_migrations(args, retries=2, user=None, password=None):
                 break
             elif response in ['n', 'no', '']:
                 print("Migration cancelled.")
-                return
+                return [], []
             else:
                 print("Please enter 'y' for yes or 'n' for no.")
     
     # Apply migrations
     failed_migrations = []
+    # Applied but not recorded: the fix is to check the schema and record it by hand, not to re-run it.
+    unrecorded_migrations = []
     for i, (migration_name, schema_path) in enumerate(pending_migrations, 1):
         print(f"\n[{i}/{len(pending_migrations)}] Running migration: {migration_name}")
         print(f"  File: {schema_path}")
@@ -311,6 +324,10 @@ def run_migrations(args, retries=2, user=None, password=None):
         if res.returncode != 0 or getattr(res, 'clickhouse_error', False):
             print(f"\n⚠️  Failed to run migration: {migration_name}")
             failed_migrations.append(migration_name)
+            if skip_confirmation:
+                # Unattended: a later migration would only add to what needs fixing by hand.
+                print("Stopping at the first failure (unattended run).")
+                break
             
             # Check if we should retry
             if retries > 0 and not skip_confirmation:
@@ -323,8 +340,12 @@ def run_migrations(args, retries=2, user=None, password=None):
                     # Retry only this specific migration
                     retry_res = run_migration_file(schema_path, args, user, password)
                     if retry_res.returncode == 0 and not getattr(retry_res, 'clickhouse_error', False):
+                        failed_migrations.remove(migration_name)
+                        if not mark_migration_as_applied(migration_name, args, user, password):
+                            print(f"\n⚠️  Applied but not recorded in helicone_migrations: {migration_name}")
+                            unrecorded_migrations.append(migration_name)
+                            continue
                         print(f"✅ Migration {migration_name} succeeded on retry")
-                        mark_migration_as_applied(migration_name, args, user, password)
                         applied_migrations.add(migration_name)
                         continue
                     else:
@@ -340,28 +361,37 @@ def run_migrations(args, retries=2, user=None, password=None):
             # Applied but not recorded (a full disk refused the INSERT, nevermined-io/argocd#923): the next
             # run re-applies it, and a non-idempotent migration then fails forever. Count it as failed.
             print(f"\n⚠️  Applied but not recorded in helicone_migrations: {migration_name}")
-            failed_migrations.append(migration_name)
+            unrecorded_migrations.append(migration_name)
+            if skip_confirmation:
+                print("Stopping at the first failure (unattended run).")
+                break
         else:
             print(f"✅ Successfully applied migration: {migration_name}")
             # Add to the in-memory set to avoid duplicate runs within the same session
             applied_migrations.add(migration_name)
     
     # Summary
-    if failed_migrations:
+    if failed_migrations or unrecorded_migrations:
         print(f"\n" + "="*60)
         print(f"Migration Summary:")
-        print(f"  Successful: {len(pending_migrations) - len(failed_migrations)}/{len(pending_migrations)}")
-        print(f"  Failed: {len(failed_migrations)}/{len(pending_migrations)}")
-        print(f"\nFailed migrations:")
-        for failed in failed_migrations:
-            print(f"  - {failed}")
+        print(f"  Pending: {len(pending_migrations)}")
+        print(f"  Failed to apply: {len(failed_migrations)}")
+        print(f"  Applied but not recorded: {len(unrecorded_migrations)}")
+        if failed_migrations:
+            print(f"\nFailed migrations (fix the cause, then run again):")
+            for failed in failed_migrations:
+                print(f"  - {failed}")
+        if unrecorded_migrations:
+            print(f"\nApplied but not recorded (do NOT run again: check the schema, then record each one):")
+            for name in unrecorded_migrations:
+                print(f"  - {name}: INSERT INTO helicone_migrations (migration_name) VALUES ('{name}')")
         print("="*60)
 
-    if not failed_migrations:
+    if not failed_migrations and not unrecorded_migrations:
         print(f"\n✅ Finished running all {len(pending_migrations)} migrations successfully")
     else:
-        print(f"\n⚠️  Finished with {len(failed_migrations)} failed migration(s)")
-    return failed_migrations
+        print(f"\n⚠️  Finished with {len(failed_migrations)} failed and {len(unrecorded_migrations)} unrecorded migration(s)")
+    return failed_migrations, unrecorded_migrations
 
 
 def list_migrations(args, user=None, password=None):
@@ -518,11 +548,11 @@ echo 'SELECT 1' | curl '{mask_userinfo(get_url(args))}/' --data-binary @-
     elif args.upgrade:
         print("Applying all migrations")
         create_migration_table(args, args.user, password)
-        failed = run_migrations(args, user=args.user, password=password)
-        if failed and args.skip_confirmation:
+        failed, unrecorded = run_migrations(args, user=args.user, password=password)
+        if (failed or unrecorded) and args.skip_confirmation:
             # Unattended (jawn's init container): fail closed, so jawn does not start on a partial schema
             # (nevermined-io/argocd#923). Interactive runs keep their prompts and exit 0.
-            print(f"Stopping: {len(failed)} migration(s) failed or were not recorded")
+            print(f"Stopping: {len(failed)} migration(s) failed to apply, {len(unrecorded)} applied but not recorded")
             sys.exit(1)
         print("Finished applying all migrations")
 

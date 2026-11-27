@@ -1,5 +1,7 @@
-"""The ClickHouse password must never reach ch_hcone.py's output: in the migrations image that output
-is jawn's init container log (nevermined-io/argocd#920). Run: python3 -m unittest clickhouse/test_ch_hcone.py
+"""Gates the migrations image build. ch_hcone.py's output is jawn's init container log, so the ClickHouse
+password must never reach it (nevermined-io/argocd#920). Its unattended --upgrade must fail closed: exit 1,
+and stop at the first failure, on a failed migration, one applied but not recorded, or a ledger it cannot
+read (nevermined-io/argocd#923). Run: python3 -m unittest clickhouse/test_ch_hcone.py
 """
 import http.server
 import os
@@ -76,66 +78,105 @@ class MaskUserinfo(unittest.TestCase):
         )
 
 
-class FakeClickHouse(http.server.BaseHTTPRequestHandler):
-    """Answers the runner's queries: every migration applied but the newest, which is pending."""
-    mode = "ok"  # "ok", "migration_fails" or "record_fails"
-    pending = ""
-
-    def do_POST(self):
-        sql = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
-        if "FROM system.tables" in sql:
-            body = "1"
-        elif "SELECT migration_name FROM helicone_migrations" in sql:
-            body = "\n".join(n for n in MIGRATIONS if n != self.pending)
-        elif "INSERT INTO helicone_migrations" in sql:
-            body = "Code: 243. DB::Exception: Cannot reserve 1.00 MiB, not enough space." if self.mode == "record_fails" else ""
-        elif "CREATE TABLE IF NOT EXISTS helicone_migrations" in sql:
-            body = ""
-        else:
-            body = "Code: 15. DB::Exception: Cannot add column: it already exists." if self.mode == "migration_fails" else ""
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(body.encode())
-
-    def log_message(self, *args):
-        pass
-
-
 MIGRATIONS = sorted(
     (f for f in os.listdir(os.path.join(HERE, "migrations")) if re.match(r"schema_\d+", f)),
     key=lambda f: int(re.search(r"schema_(\d+)", f).group(1)),
 )
+ERROR = "Code: 15. DB::Exception: Cannot add index: index with this name already exists."
+FULL_DISK = "Code: 243. DB::Exception: Cannot reserve 1.00 MiB, not enough space."
+
+
+def fake_clickhouse(mode, pending):
+    """A ClickHouse that answers the runner, records what it was sent, and fails as `mode` says:
+    "ok", "migration_fails" (the first pending migration's statements), "record_fails" (every INSERT into
+    helicone_migrations) or "select_fails" (the read of helicone_migrations)."""
+    state = {"inserts": [], "migration_statements": 0}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            sql = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+            status, body = 200, ""
+            if "FROM system.tables" in sql:
+                body = "1"
+            elif "SELECT migration_name FROM helicone_migrations" in sql:
+                if mode == "select_fails":
+                    status, body = 500, "Code: 241. DB::Exception: Memory limit exceeded. (MEMORY_LIMIT_EXCEEDED)"
+                else:
+                    body = "\n".join(n for n in MIGRATIONS if n not in pending)
+            elif "INSERT INTO helicone_migrations" in sql:
+                if mode == "record_fails":
+                    status, body = 500, FULL_DISK
+                else:
+                    state["inserts"].append(re.search(r"'([^']+)'", sql).group(1))
+            elif "CREATE TABLE IF NOT EXISTS helicone_migrations" in sql:
+                pass
+            else:
+                state["migration_statements"] += 1
+                first = open(os.path.join(HERE, "migrations", pending[0])).read() if pending else ""
+                if mode == "migration_fails" and sql.strip().rstrip(";").split()[:3] == first.strip().split()[:3]:
+                    status, body = 500, ERROR
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, *args):
+            pass
+
+    return Handler, state
 
 
 class UpgradeFailsClosed(unittest.TestCase):
-    """--upgrade --skip-confirmation is jawn's init container: a migration that fails, or applies but is
-    not recorded (a full disk refused the INSERT, argocd#923), must stop jawn instead of letting it start."""
+    """--upgrade --skip-confirmation is jawn's init container (nevermined-io/argocd#923). A migration that
+    fails, applies without being recorded (a full disk refused the INSERT), or a ledger it cannot read must
+    stop jawn instead of letting it start on a partial schema, and must stop at the first failure."""
 
-    def run_upgrade(self, mode):
-        FakeClickHouse.mode, FakeClickHouse.pending = mode, MIGRATIONS[-1]
-        server = http.server.HTTPServer(("127.0.0.1", 0), FakeClickHouse)
+    def run_upgrade(self, mode, pending):
+        handler, state = fake_clickhouse(mode, pending)
+        server = http.server.HTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             env = {**os.environ, "CLICKHOUSE_HOST": f"http://127.0.0.1:{server.server_port}",
                    "CLICKHOUSE_USER": "default", "CLICKHOUSE_PASSWORD": "x"}
-            return subprocess.run([sys.executable, SCRIPT, "--upgrade", "--no-password", "--skip-confirmation"],
-                                  env=env, capture_output=True, text=True, timeout=60)
+            result = subprocess.run([sys.executable, SCRIPT, "--upgrade", "--no-password", "--skip-confirmation"],
+                                    env=env, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
         finally:
             server.shutdown()
+            server.server_close()
+        self.assertNotIn("Traceback", result.stderr)
+        return result, state
 
-    def test_clean_upgrade_exits_zero(self):
-        result = self.run_upgrade("ok")
+    # The last two migrations: 78 is one statement, 79 is two.
+    PENDING = MIGRATIONS[-2:]
+
+    def test_clean_upgrade_records_each_migration(self):
+        result, state = self.run_upgrade("ok", self.PENDING)
         self.assertEqual(result.returncode, 0, result.stdout[-500:])
+        self.assertEqual(state["inserts"], self.PENDING)
 
-    def test_failed_migration_exits_nonzero(self):
-        result = self.run_upgrade("migration_fails")
-        self.assertEqual(result.returncode, 1, result.stdout[-500:])
-        self.assertIn(MIGRATIONS[-1], result.stdout)
+    def test_nothing_pending_exits_zero(self):
+        result, state = self.run_upgrade("ok", [])
+        self.assertEqual(result.returncode, 0, result.stdout[-500:])
+        self.assertIn("No migrations to apply", result.stdout)
 
-    def test_unrecorded_migration_exits_nonzero(self):
-        result = self.run_upgrade("record_fails")
+    def test_failed_migration_is_not_recorded_and_stops_the_run(self):
+        result, state = self.run_upgrade("migration_fails", self.PENDING)
         self.assertEqual(result.returncode, 1, result.stdout[-500:])
-        self.assertIn("not recorded", result.stdout)
+        self.assertIn(f"Failed to run migration: {self.PENDING[0]}", result.stdout)
+        self.assertNotIn(self.PENDING[0], state["inserts"])
+        self.assertNotIn(f"Running migration: {self.PENDING[1]}", result.stdout)
+
+    def test_unrecorded_migration_stops_the_run_and_says_how_to_record_it(self):
+        result, state = self.run_upgrade("record_fails", self.PENDING)
+        self.assertEqual(result.returncode, 1, result.stdout[-500:])
+        self.assertIn(f"Applied but not recorded in helicone_migrations: {self.PENDING[0]}", result.stdout)
+        self.assertIn(f"INSERT INTO helicone_migrations (migration_name) VALUES ('{self.PENDING[0]}')", result.stdout)
+        self.assertNotIn(f"Running migration: {self.PENDING[1]}", result.stdout)
+
+    def test_unreadable_ledger_applies_nothing(self):
+        result, state = self.run_upgrade("select_fails", self.PENDING)
+        self.assertEqual(result.returncode, 1, result.stdout[-500:])
+        self.assertIn("cannot read helicone_migrations", result.stdout)
+        self.assertEqual(state["migration_statements"], 0)
 
 
 class EntrypointKeepsPasswordOutOfArgv(unittest.TestCase):
