@@ -91,17 +91,18 @@ def squash(sql):
     return " ".join(sql.split()).rstrip(";")
 
 
-def fake_clickhouse(mode, pending):
+def fake_clickhouse(mode, pending, target=None):
     """A ClickHouse that answers the runner, records what it was sent, and fails as `mode` says:
-    "ok", "migration_fails" (every statement of the first pending migration), "second_statement_fails"
-    (only its second statement), "record_fails" (every INSERT into helicone_migrations), "check_fails"
+    "ok", "migration_fails" (every statement of the target migration, by default the first pending one),
+    "second_statement_fails" (only its second statement), "record_fails" (every INSERT into helicone_migrations), "check_fails"
     (the existence check of helicone_migrations) or "select_fails" (the read of helicone_migrations).
     "migration_502" and "record_503" are a proxy in front of ClickHouse failing those, with no ClickHouse
     text in the body. It finds the ledger only when the runner looks in currentDatabase()."""
     state = {"inserts": [], "migration_statements": 0, "first_statements": 0}
     first = ""
-    if pending:
-        with open(os.path.join(HERE, "migrations", pending[0])) as f:
+    target = target or (pending[0] if pending else None)
+    if target:
+        with open(os.path.join(HERE, "migrations", target)) as f:
             first = squash(f.read())
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -153,8 +154,8 @@ class UpgradeFailsClosed(unittest.TestCase):
     fails, applies without being recorded (a full disk refused the INSERT), or a ledger it cannot read must
     stop jawn instead of letting it start on a partial schema, and must stop at the first failure."""
 
-    def run_upgrade(self, mode, pending):
-        handler, state = fake_clickhouse(mode, pending)
+    def run_upgrade(self, mode, pending, target=None):
+        handler, state = fake_clickhouse(mode, pending, target)
         server = http.server.HTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
@@ -192,10 +193,22 @@ class UpgradeFailsClosed(unittest.TestCase):
         self.assertNotIn(self.PENDING[0], state["inserts"])
         self.assertNotIn(f"Running migration: {self.PENDING[1]}", result.stdout)
         # The summary covers a restart after a refused record, which also lands here.
-        self.assertIn("If ClickHouse said it already exists, it was applied but not recorded", result.stdout)
+        self.assertIn("If ClickHouse said it already exists, it may have been applied but not recorded", result.stdout)
+        self.assertIn("including data statements", result.stdout)
+        self.assertIn(f"  - {self.PENDING[0]} (failed on statement 1/1)\n", result.stdout)
         self.assertIn(f"    INSERT INTO helicone_migrations (migration_name) VALUES ('{self.PENDING[0]}')", result.stdout)
         self.assertIn("  Applied: 0\n", result.stdout)
         self.assertIn("  Not attempted: 1\n", result.stdout)
+
+    def test_counts_after_an_applied_migration(self):
+        # 78 applies and is recorded, then 79's second statement fails.
+        result, state = self.run_upgrade("second_statement_fails", self.PENDING, target=self.PENDING[1])
+        self.assertEqual(result.returncode, 1, result.stdout[-500:])
+        self.assertEqual(state["inserts"], [self.PENDING[0]])
+        self.assertIn("  Applied: 1\n", result.stdout)
+        self.assertIn("  Failed to apply: 1\n", result.stdout)
+        self.assertIn("  Not attempted: 0\n", result.stdout)
+        self.assertIn(f"  - {self.PENDING[1]} (failed on statement 2/2)\n", result.stdout)
 
     def test_failed_second_statement_fails_the_migration(self):
         result, state = self.run_upgrade("second_statement_fails", self.PENDING[1:])

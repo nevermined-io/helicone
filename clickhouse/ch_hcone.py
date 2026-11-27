@@ -113,7 +113,8 @@ def run_curl_command(query, args, user=None, password=None, migration_file=None)
                             capture_output=True, text=True, env=env)
     
     # Exit 22 is an HTTP status of 400 or more: ClickHouse, or something in front of it, answered and
-    # refused the statement. Any other non-zero exit means it could not be reached.
+    # refused the statement. Any other non-zero exit means no complete HTTP answer: unreachable, or the
+    # connection dropped (curl 52/56, e.g. ClickHouse restarted mid-ALTER), so the statement may have run.
     http_error = result.returncode == 22
 
     # Check for curl errors (connection issues)
@@ -160,7 +161,9 @@ def run_migration_file(migration_file, args, user=None, password=None):
     
     if len(statements) == 1:
         # Single statement, run normally
-        return run_curl_command(None, args, user, password, migration_file)
+        result = run_curl_command(None, args, user, password, migration_file)
+        result.failed_statement = "1/1" if result.clickhouse_error else None
+        return result
     
     # Multiple statements, run each separately
     print(f"  Migration contains {len(statements)} statements")
@@ -179,6 +182,7 @@ def run_migration_file(migration_file, args, user=None, password=None):
             compound_result = subprocess.CompletedProcess(args=[], returncode=1)
             compound_result.clickhouse_error = True
             compound_result.stdout = f"Failed on statement {i}/{len(statements)}"
+            compound_result.failed_statement = f"{i}/{len(statements)}"
             return compound_result
     
     # All statements succeeded
@@ -317,6 +321,8 @@ def run_migrations(args, retries=2, user=None, password=None):
     
     # Apply migrations
     failed_migrations = []
+    # Which statement of each failed file failed: the ones after it never ran.
+    failed_at = {}
     # Applied but not recorded: the fix is to check the schema and record it by hand, not to re-run it.
     unrecorded_migrations = []
     applied_now = 0
@@ -329,6 +335,7 @@ def run_migrations(args, retries=2, user=None, password=None):
         if res.returncode != 0 or getattr(res, 'clickhouse_error', False):
             print(f"\n⚠️  Failed to run migration: {migration_name}")
             failed_migrations.append(migration_name)
+            failed_at[migration_name] = getattr(res, 'failed_statement', None)
             if skip_confirmation:
                 # Unattended: a later migration would only add to what needs fixing by hand.
                 print("Stopping at the first failure (unattended run).")
@@ -390,10 +397,13 @@ def run_migrations(args, retries=2, user=None, password=None):
             # A restart after a refused record lands here: the ledger still lacks the row, so the migration
             # runs again, and a non-idempotent one then fails with "already exists" (nevermined-io/argocd#923).
             # The runner cannot tell the two cases apart, so the text covers both.
-            print(f"\nFailed migrations. If ClickHouse said it already exists, it was applied but not recorded:")
-            print(f"check the schema, then record it with the INSERT below. Otherwise fix the cause and run again.")
+            print(f"\nFailed migrations. If ClickHouse said it already exists, it may have been applied but not recorded:")
+            print(f"check that every statement of the file took effect, including data statements (MATERIALIZE,")
+            print(f"backfills) that a schema check cannot show; the statements after the failed one never ran.")
+            print(f"Then record it with the INSERT below. Otherwise fix the cause and run again.")
             for failed in failed_migrations:
-                print(f"  - {failed}")
+                where = f" (failed on statement {failed_at[failed]})" if failed_at.get(failed) else ""
+                print(f"  - {failed}{where}")
                 print(f"    INSERT INTO helicone_migrations (migration_name) VALUES ('{failed}')")
         if unrecorded_migrations:
             print(f"\nApplied but not recorded (do NOT run again: check the schema, then record each one):")
