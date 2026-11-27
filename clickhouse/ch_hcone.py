@@ -321,7 +321,8 @@ def run_migrations(args, retries=2, user=None, password=None):
     
     # Apply migrations
     failed_migrations = []
-    # Which statement of each failed file failed: the ones after it never ran.
+    # Which statement of each failed file failed: the ones after it did not run this time (after a refused
+    # record, they ran in the earlier attempt).
     failed_at = {}
     # Applied but not recorded: the fix is to check the schema and record it by hand, not to re-run it.
     unrecorded_migrations = []
@@ -399,7 +400,8 @@ def run_migrations(args, retries=2, user=None, password=None):
             # The runner cannot tell the two cases apart, so the text covers both.
             print(f"\nFailed migrations. If ClickHouse said it already exists, it may have been applied but not recorded:")
             print(f"check that every statement of the file took effect, including data statements (MATERIALIZE,")
-            print(f"backfills) that a schema check cannot show; the statements after the failed one never ran.")
+            print(f"backfills) that a schema check cannot show. The statements after the failed one did not run")
+            print(f"this time; after a refused record they ran in the earlier attempt, so never re-run one blindly.")
             print(f"Then record it with the INSERT below. Otherwise fix the cause and run again.")
             for failed in failed_migrations:
                 where = f" (failed on statement {failed_at[failed]})" if failed_at.get(failed) else ""

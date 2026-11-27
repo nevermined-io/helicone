@@ -210,6 +210,13 @@ class UpgradeFailsClosed(unittest.TestCase):
         self.assertIn("  Not attempted: 0\n", result.stdout)
         self.assertIn(f"  - {self.PENDING[1]} (failed on statement 2/2)\n", result.stdout)
 
+    def test_failed_first_statement_of_two_names_it(self):
+        result, state = self.run_upgrade("migration_fails", self.PENDING[1:])
+        self.assertEqual(result.returncode, 1, result.stdout[-500:])
+        self.assertIn(f"  - {self.PENDING[1]} (failed on statement 1/2)\n", result.stdout)
+        self.assertIn("did not run\nthis time", result.stdout)
+        self.assertEqual(state["inserts"], [])
+
     def test_failed_second_statement_fails_the_migration(self):
         result, state = self.run_upgrade("second_statement_fails", self.PENDING[1:])
         self.assertEqual(result.returncode, 1, result.stdout[-500:])
