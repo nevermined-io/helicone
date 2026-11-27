@@ -1,10 +1,12 @@
 """The ClickHouse password must never reach ch_hcone.py's output: in the migrations image that output
 is jawn's init container log (nevermined-io/argocd#920). Run: python3 -m unittest clickhouse/test_ch_hcone.py
 """
+import http.server
 import os
 import re
 import subprocess
 import sys
+import threading
 import unittest
 import uuid
 
@@ -72,6 +74,68 @@ class MaskUserinfo(unittest.TestCase):
         self.assertEqual(
             ch_hcone.mask_userinfo(URL("http://default:pw@127.0.0.1:1")), "http://[REDACTED]@127.0.0.1:1"
         )
+
+
+class FakeClickHouse(http.server.BaseHTTPRequestHandler):
+    """Answers the runner's queries: every migration applied but the newest, which is pending."""
+    mode = "ok"  # "ok", "migration_fails" or "record_fails"
+    pending = ""
+
+    def do_POST(self):
+        sql = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+        if "FROM system.tables" in sql:
+            body = "1"
+        elif "SELECT migration_name FROM helicone_migrations" in sql:
+            body = "\n".join(n for n in MIGRATIONS if n != self.pending)
+        elif "INSERT INTO helicone_migrations" in sql:
+            body = "Code: 243. DB::Exception: Cannot reserve 1.00 MiB, not enough space." if self.mode == "record_fails" else ""
+        elif "CREATE TABLE IF NOT EXISTS helicone_migrations" in sql:
+            body = ""
+        else:
+            body = "Code: 15. DB::Exception: Cannot add column: it already exists." if self.mode == "migration_fails" else ""
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def log_message(self, *args):
+        pass
+
+
+MIGRATIONS = sorted(
+    (f for f in os.listdir(os.path.join(HERE, "migrations")) if re.match(r"schema_\d+", f)),
+    key=lambda f: int(re.search(r"schema_(\d+)", f).group(1)),
+)
+
+
+class UpgradeFailsClosed(unittest.TestCase):
+    """--upgrade --skip-confirmation is jawn's init container: a migration that fails, or applies but is
+    not recorded (a full disk refused the INSERT, argocd#923), must stop jawn instead of letting it start."""
+
+    def run_upgrade(self, mode):
+        FakeClickHouse.mode, FakeClickHouse.pending = mode, MIGRATIONS[-1]
+        server = http.server.HTTPServer(("127.0.0.1", 0), FakeClickHouse)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            env = {**os.environ, "CLICKHOUSE_HOST": f"http://127.0.0.1:{server.server_port}",
+                   "CLICKHOUSE_USER": "default", "CLICKHOUSE_PASSWORD": "x"}
+            return subprocess.run([sys.executable, SCRIPT, "--upgrade", "--no-password", "--skip-confirmation"],
+                                  env=env, capture_output=True, text=True, timeout=60)
+        finally:
+            server.shutdown()
+
+    def test_clean_upgrade_exits_zero(self):
+        result = self.run_upgrade("ok")
+        self.assertEqual(result.returncode, 0, result.stdout[-500:])
+
+    def test_failed_migration_exits_nonzero(self):
+        result = self.run_upgrade("migration_fails")
+        self.assertEqual(result.returncode, 1, result.stdout[-500:])
+        self.assertIn(MIGRATIONS[-1], result.stdout)
+
+    def test_unrecorded_migration_exits_nonzero(self):
+        result = self.run_upgrade("record_fails")
+        self.assertEqual(result.returncode, 1, result.stdout[-500:])
+        self.assertIn("not recorded", result.stdout)
 
 
 class EntrypointKeepsPasswordOutOfArgv(unittest.TestCase):

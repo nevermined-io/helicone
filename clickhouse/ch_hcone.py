@@ -247,7 +247,8 @@ def mark_migration_as_applied(migration_name, args, user=None, password=None):
     query = f"""
     INSERT INTO helicone_migrations (migration_name) VALUES ('{migration_name}');
     """
-    run_curl_command(query, args, user, password)
+    res = run_curl_command(query, args, user, password)
+    return res.returncode == 0 and not getattr(res, 'clickhouse_error', False)
 
 
 def preview_migrations(args, user=None, password=None):
@@ -335,10 +336,13 @@ def run_migrations(args, retries=2, user=None, password=None):
                 if continue_response not in ['y', 'yes']:
                     print("\nStopping migration process.")
                     break
+        elif not mark_migration_as_applied(migration_name, args, user, password):
+            # Applied but not recorded (a full disk refused the INSERT, nevermined-io/argocd#923): the next
+            # run re-applies it, and a non-idempotent migration then fails forever. Count it as failed.
+            print(f"\n⚠️  Applied but not recorded in helicone_migrations: {migration_name}")
+            failed_migrations.append(migration_name)
         else:
             print(f"✅ Successfully applied migration: {migration_name}")
-            mark_migration_as_applied(
-                migration_name, args, user, password)
             # Add to the in-memory set to avoid duplicate runs within the same session
             applied_migrations.add(migration_name)
     
@@ -357,6 +361,7 @@ def run_migrations(args, retries=2, user=None, password=None):
         print(f"\n✅ Finished running all {len(pending_migrations)} migrations successfully")
     else:
         print(f"\n⚠️  Finished with {len(failed_migrations)} failed migration(s)")
+    return failed_migrations
 
 
 def list_migrations(args, user=None, password=None):
@@ -513,7 +518,12 @@ echo 'SELECT 1' | curl '{mask_userinfo(get_url(args))}/' --data-binary @-
     elif args.upgrade:
         print("Applying all migrations")
         create_migration_table(args, args.user, password)
-        run_migrations(args, user=args.user, password=password)
+        failed = run_migrations(args, user=args.user, password=password)
+        if failed and args.skip_confirmation:
+            # Unattended (jawn's init container): fail closed, so jawn does not start on a partial schema
+            # (nevermined-io/argocd#923). Interactive runs keep their prompts and exit 0.
+            print(f"Stopping: {len(failed)} migration(s) failed or were not recorded")
+            sys.exit(1)
         print("Finished applying all migrations")
 
     elif args.list_migrations:
